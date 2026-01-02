@@ -1,4 +1,5 @@
 import logging
+import os
 from rich.logging import RichHandler
 from rich.console import Console
 from rich.theme import Theme
@@ -36,6 +37,22 @@ def get_logger(name="PEARL", level=logging.INFO):
     return logger
 
 logger = get_logger()
+
+def add_file_handler(path: str, level: int = logging.INFO) -> None:
+    logger = get_logger()
+    abs_path = os.path.abspath(path)
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler) and os.path.abspath(
+            handler.baseFilename
+        ) == abs_path:
+            return
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    file_handler = logging.FileHandler(abs_path)
+    file_handler.setLevel(level)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    logger.addHandler(file_handler)
 
 
 def get_model_name(model_path: str) -> str:

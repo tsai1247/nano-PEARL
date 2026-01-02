@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import time
@@ -6,7 +7,7 @@ from abc import abstractmethod
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
-from nano_pearl.utils.pearl_logger import logger
+from nano_pearl.utils.pearl_logger import logger, add_file_handler
 from nano_pearl.pearl_config import PEARLConfig
 from dataclasses import dataclass
 from nano_pearl.models import model_dict
@@ -27,15 +28,25 @@ class ModelRunnerBase:
     all the ModelRunner sub-processes are forked from the main process.
     we will define a controller to control the sub-processes and shared memory.
     """
-    def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
+    def __init__(
+        self,
+        config: PEARLConfig,
+        rank: int,
+        event: Event,
+        control_event: Event,
+        control_ticket,
+    ):
         self.rank = rank
         self.event = event
-        self.is_draft = rank in config.draft_config.devices
+        log_dir = os.getenv("NANO_PEARL_LOG_DIR", "logs")
+        add_file_handler(os.path.join(log_dir, f"nano_pearl_rank{rank}.log"))
+        self.is_draft = rank in config.draft_config.ranks
         # global config for PEARL, group config for the draft / target group
         self.global_config = config
         self.group_config = config.draft_config if self.is_draft else config.target_config
         self.hf_config = self.group_config.hf_config
-        self.control_event = control_event if rank == 0  else None
+        self.control_event = control_event if rank == 0 else None
+        self.control_ticket = control_ticket if rank == 0 else None
 
         self.block_size = self.global_config.kvcache_block_size
         self.tensor_parallel_size = self.group_config.tensor_parallel_size
@@ -53,13 +64,35 @@ class ModelRunnerBase:
         We use a global process group to initialize the dist.
         Create 3 sub-groups for the draft and target group and verify group.
         """
-        dist.init_process_group("nccl", 
-                                f"tcp://localhost:2333", 
-                                world_size=self.global_config.world_size,
-                                rank=self.rank)
-        draft_group = dist.new_group(self.global_config.draft_config.devices)
-        target_group = dist.new_group(self.global_config.target_config.devices)
-        verify_group = dist.new_group([self.global_config.draft_config.master_rank] + self.global_config.target_config.devices )
+        global_backend = (
+            "gloo" if self.global_config.share_draft_target_gpus else "nccl"
+        )
+        dist.init_process_group(
+            global_backend,
+            f"tcp://localhost:2333",
+            world_size=self.global_config.world_size,
+            rank=self.rank,
+        )
+        self.world_group = dist.group.WORLD
+        if self.global_config.share_draft_target_gpus:
+            draft_group = dist.new_group(
+                self.global_config.draft_config.ranks, backend="nccl"
+            )
+            target_group = dist.new_group(
+                self.global_config.target_config.ranks, backend="nccl"
+            )
+            verify_group = dist.new_group(
+                [self.global_config.draft_config.master_rank]
+                + self.global_config.target_config.ranks,
+                backend="gloo",
+            )
+        else:
+            draft_group = dist.new_group(self.global_config.draft_config.ranks)
+            target_group = dist.new_group(self.global_config.target_config.ranks)
+            verify_group = dist.new_group(
+                [self.global_config.draft_config.master_rank]
+                + self.global_config.target_config.ranks
+            )
         self.group = draft_group if self.is_draft else target_group
         self.verify_group = verify_group
 
@@ -68,7 +101,7 @@ class ModelRunnerBase:
             rank=self.rank,
             group=self.group,
             group_name=self.group_name,
-            local_rank=self.rank if self.is_draft else self.rank - self.global_config.draft_config.tensor_parallel_size,
+            local_rank=self.group_config.ranks.index(self.rank),
             master_rank=self.group_config.master_rank,
             is_draft=self.is_draft,
             tp_size=self.tensor_parallel_size,
@@ -87,8 +120,15 @@ class ModelRunnerBase:
         self.shm = SharedMemory(name=self.group_name)
         if self.rank == 0:
             logger.info(f"[Sub-Process] Draft Model and Target Model initialized. Starting to run the model...", color="yellow")
-            self.control_event.set()
+            self._signal_control()
         self.loop()
+
+    def _signal_control(self):
+        if self.control_event is None or self.control_ticket is None:
+            return
+        with self.control_ticket.get_lock():
+            self.control_ticket.value += 1
+        self.control_event.set()
     
     def init_model_and_kvcache(self):
         """
@@ -96,7 +136,8 @@ class ModelRunnerBase:
         note that in nano-PEARL, the model requires a tp_params to specify the TP settings.
         """
         self.default_dtype = torch.get_default_dtype()
-        torch.cuda.set_device(self.rank)
+        device_id = self.group_config.rank_to_device[self.rank]
+        torch.cuda.set_device(device_id)
         torch.set_default_dtype(self.hf_config.torch_dtype)
         torch.set_default_device("cuda")
         self.model = model_dict[self.hf_config.architectures[0]](self.hf_config, self.tp_params)
@@ -105,6 +146,8 @@ class ModelRunnerBase:
         self.sampler = Sampler()
         self.warmup_model()
         self.tokenizer = AutoTokenizer.from_pretrained(self.group_config.model)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         self.allocate_kv_cache()
         self.scheduler = Scheduler(self.global_config)
         if not self.global_config.enforce_eager:
@@ -129,8 +172,31 @@ class ModelRunnerBase:
             else hf_config.hidden_size // hf_config.num_attention_heads
         )
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        self.global_config.num_kvcache_blocks = int(total * self.global_config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert self.global_config.num_kvcache_blocks > 0
+        usable_bytes = int(
+            total * self.global_config.gpu_memory_utilization - used - peak + current
+        )
+        self.global_config.num_kvcache_blocks = usable_bytes // block_bytes
+        if self.global_config.num_kvcache_blocks <= 0:
+            logger.error(
+                "[Rank %s: %s] insufficient KV cache memory: "
+                "usable_bytes=%s total=%s used=%s free=%s peak=%s current=%s "
+                "gpu_memory_utilization=%s block_bytes=%s",
+                self.rank,
+                self.group_name,
+                usable_bytes,
+                total,
+                used,
+                free,
+                peak,
+                current,
+                self.global_config.gpu_memory_utilization,
+                block_bytes,
+            )
+            raise RuntimeError(
+                "nano-pearl KV cache allocation failed (num_kvcache_blocks <= 0). "
+                "Try increasing gpu_memory_utilization (--nano-pearl-gpu-memory-utilization), "
+                "reducing max_num_seqs/max_num_batched_tokens, or using smaller models."
+            )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, self.global_config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -139,18 +205,69 @@ class ModelRunnerBase:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
         dist.barrier()
-        if self.tp_params.local_rank == 0:
-            logger.info(f"[Rank {self.rank}: {self.group_name}] allocated GPU memory {self.global_config.num_kvcache_blocks * block_bytes / 2**30} GiB for kvcache.", color="green")
+        # if self.tp_params.local_rank == 0:
+            # logger.info(f"[Rank {self.rank}: {self.group_name}] allocated GPU memory {self.global_config.num_kvcache_blocks * block_bytes / 2**30} GiB for kvcache.", color="green")
 
     def loop(self):
         while True:
             method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if self.rank == 0 and method_name != "exit":
-                self.control_event.set()
+            # logger.info(
+            #     f"[Rank {self.rank}: {self.group_name}] recv method={method_name}"
+            # )
+            try:
+                self.call(method_name, *args)
+            except Exception:
+                logger.exception(
+                    f"[Rank {self.rank}: {self.group_name}] error in method={method_name}"
+                )
+                if self.rank == 0 and method_name != "exit":
+                    self._signal_control()
+                raise
+            if self.rank == 0 and method_name not in ("exit", "pearl_stream_generate"):
+                self._signal_control()
             
             if method_name == "exit":
                 break
+
+    def _force_finish_by_max_tokens(self):
+        if not self.scheduler.running:
+            return
+        finished = []
+        for seq in list(self.scheduler.running):
+            if seq.max_tokens is None:
+                continue
+            if seq.num_completion_tokens >= seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+                finished.append(seq)
+        if not finished:
+            return
+        for seq in finished:
+            logger.info(
+                f"[Rank {self.rank}: {self.group_name}] force finish seq_id={seq.seq_id} "
+                f"num_completion_tokens={seq.num_completion_tokens} max_tokens={seq.max_tokens}"
+            )
+            self.scheduler.block_manager.deallocate(seq)
+            if seq in self.scheduler.running:
+                self.scheduler.running.remove(seq)
+            self.scheduler.finished.append(seq)
+
+    def _stream_write_output(self, prev_lengths: dict[int, int]):
+        if self.rank == self.global_config.target_config.master_rank:
+            output = []
+            for seq in list(self.scheduler.running) + list(self.scheduler.finished):
+                prev_len = prev_lengths.get(seq.seq_id, 0)
+                new_tokens = seq.completion_token_ids[prev_len:]
+                if new_tokens:
+                    output.append((seq.seq_id, new_tokens))
+                    prev_lengths[seq.seq_id] = prev_len + len(new_tokens)
+            done = self.scheduler.is_finished()
+            data = pickle.dumps([output, done])
+            n = len(data)
+            self.shm.buf[0:4] = n.to_bytes(4, "little")
+            self.shm.buf[4:n+4] = data
+        dist.barrier()
+        if self.rank == 0:
+            self._signal_control()
 
     def read_shm(self):
         self.event.wait()
@@ -297,7 +414,6 @@ class ModelRunnerBase:
             block_tables=block_tables,
             outputs=outputs,
         )
-        logger.info("CUDA graph captured.", color="blue")
         dist.barrier()
 
     def add_request(self, seq: Sequence):
@@ -340,8 +456,8 @@ class ModelRunnerBase:
         logits = self.run_model(input_ids, positions, True)
         torch.cuda.empty_cache()
         dist.barrier()
-        if self.tp_params.local_rank == 0:
-            logger.info(f"[Rank {self.rank}: {self.group_name}] Num seqs: {num_seqs} Warmup finished.", color="green")
+        # if self.tp_params.local_rank == 0:
+            # logger.info(f"[Rank {self.rank}: {self.group_name}] Num seqs: {num_seqs} Warmup finished.", color="green")
 
     def auto_set_gamma(self):
         torch.cuda.empty_cache()
@@ -370,18 +486,46 @@ class ModelRunnerBase:
             speed[idx] = sum(bs_speed) / len(bs_speed)
             self.clear_requests()
         
-        global_speed = torch.zeros((self.global_config.world_size, len(bs)), dtype=torch.float32, device="cuda")
-        global_speed[self.rank] = speed
-        dist.all_reduce(global_speed, op=dist.ReduceOp.SUM)
+        if self.global_config.share_draft_target_gpus:
+            group_speed = speed.clone()
+            dist.all_reduce(group_speed, op=dist.ReduceOp.SUM, group=self.group)
+            group_speed /= self.tensor_parallel_size
+            draft_speed = torch.zeros_like(group_speed, device="cpu")
+            target_speed = torch.zeros_like(group_speed, device="cpu")
+            if self.is_draft:
+                draft_speed.copy_(group_speed.cpu())
+            else:
+                target_speed.copy_(group_speed.cpu())
+            dist.broadcast(
+                draft_speed,
+                src=self.global_config.draft_config.master_rank,
+                group=self.world_group,
+            )
+            dist.broadcast(
+                target_speed,
+                src=self.global_config.target_config.master_rank,
+                group=self.world_group,
+            )
+        else:
+            global_speed = torch.zeros(
+                (self.global_config.world_size, len(bs)),
+                dtype=torch.float32,
+                device="cuda",
+            )
+            global_speed[self.rank] = speed
+            dist.all_reduce(global_speed, op=dist.ReduceOp.SUM)
 
-        split_rank = self.global_config.draft_config.tensor_parallel_size
-        draft_speed = global_speed[:split_rank].mean(dim=0)
-        target_speed = global_speed[split_rank:].mean(dim=0)
+            split_rank = self.global_config.draft_config.tensor_parallel_size
+            draft_speed = global_speed[:split_rank].mean(dim=0)
+            target_speed = global_speed[split_rank:].mean(dim=0)
+
         gamma_list = torch.round(draft_speed / target_speed).long().tolist()
         self.gamma_list = {b: g for b, g in zip(bs, gamma_list)}
         if self.rank == 0:
             for idx, b in enumerate(bs):
-                logger.info(f"batch size: {b}, draft speed: {draft_speed[idx].item():.2f} tok/s, target speed: {target_speed[idx].item():.2f} tok/s, gamma: {self.gamma_list[b]}")
+                logger.info(
+                    f"batch size: {b}, draft speed: {draft_speed[idx].item():.2f} tok/s, target speed: {target_speed[idx].item():.2f} tok/s, gamma: {self.gamma_list[b]}"
+                )
 
         reset_context(self.tp_params)
         torch.cuda.empty_cache()
@@ -413,6 +557,7 @@ class ModelRunnerBase:
 
     def pearl_generate(self):
         dist.barrier()
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] pearl_generate barrier done")
         torch.cuda.synchronize()
         start_time = time.time()
         self.prefill()
@@ -420,9 +565,13 @@ class ModelRunnerBase:
         # determine the gamma for each batch size
         if self.gamma == -1:
             self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+            logger.info(
+                f"[Rank {self.rank}: {self.group_name}] gamma auto-set to {self.gamma}"
+            )
 
         while not self.scheduler.is_finished():
             self.pearl_step()
+            self._force_finish_by_max_tokens()
         
         torch.cuda.synchronize()
         end_time = time.time()
@@ -435,6 +584,26 @@ class ModelRunnerBase:
             self.shm.buf[0:4] = n.to_bytes(4, "little")
             self.shm.buf[4:n+4] = data
             
+        self.clear_requests()
+
+    def pearl_stream_generate(self):
+        dist.barrier()
+        self.prefill()
+
+        if self.gamma == -1:
+            self.gamma = self.gamma_list[next(x for x in self.gamma_list if x >= len(self.scheduler.running))]
+            logger.info(
+                f"[Rank {self.rank}: {self.group_name}] gamma auto-set to {self.gamma}"
+            )
+
+        prev_lengths = {}
+        self._stream_write_output(prev_lengths)
+
+        while not self.scheduler.is_finished():
+            self.pearl_step()
+            self._force_finish_by_max_tokens()
+            self._stream_write_output(prev_lengths)
+
         self.clear_requests()
 
     def pearl_bench_generate(self, num_pearl_steps: int = 100):
@@ -483,8 +652,15 @@ class ModelRunnerBase:
 
 
 class DraftModelRunner(ModelRunnerBase):
-    def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
-        super().__init__(config, rank, event, control_event)
+    def __init__(
+        self,
+        config: PEARLConfig,
+        rank: int,
+        event: Event,
+        control_event: Event,
+        control_ticket,
+    ):
+        super().__init__(config, rank, event, control_event, control_ticket)
 
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         return super().prepare_decode(seqs)
@@ -506,7 +682,9 @@ class DraftModelRunner(ModelRunnerBase):
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
 
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] draft verify start")
         self.verify(seqs)
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] draft verify done")
 
     @torch.inference_mode()
     def verify(self, seqs: list[Sequence]):
@@ -515,15 +693,32 @@ class DraftModelRunner(ModelRunnerBase):
             next_round_input = []
             for seq in seqs:
                 if seq.pre_verify:
-                    to_be_verified_tokens.append(seq.token_ids[-self.gamma])
+                    to_be_verified_tokens.append(seq.token_ids[-1])
                 else:
-                    to_be_verified_tokens.extend(seq.token_ids[-2*self.gamma+1:-self.gamma+1])
+                    to_be_verified_tokens.extend(seq.token_ids[-self.gamma:])
                 next_round_input.extend(seq.token_ids[-self.gamma:])
-            msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
+            msg_device = "cpu" if self.global_config.share_draft_target_gpus else "cuda"
+            msg = torch.tensor(
+                to_be_verified_tokens + next_round_input,
+                dtype=torch.int64,
+                device=msg_device,
+            )
+            # logger.info(f"[Rank {self.rank}: {self.group_name}] draft broadcast verify msg")
             dist.broadcast(msg, src=self.rank, group=self.verify_group)
         
-        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        verify_res_device = (
+            "cpu" if self.global_config.share_draft_target_gpus else "cuda"
+        )
+        verify_res = torch.zeros(
+            (4, len(seqs)), dtype=torch.int64, device=verify_res_device
+        )
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] draft wait verify_res")
+        dist.broadcast(
+            verify_res,
+            src=self.global_config.target_config.master_rank,
+            group=self.world_group,
+        )
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] draft got verify_res")
         
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
@@ -554,8 +749,15 @@ class DraftModelRunner(ModelRunnerBase):
 
 
 class TargetModelRunner(ModelRunnerBase):
-    def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
-        super().__init__(config, rank, event, control_event)
+    def __init__(
+        self,
+        config: PEARLConfig,
+        rank: int,
+        event: Event,
+        control_event: Event,
+        control_ticket,
+    ):
+        super().__init__(config, rank, event, control_event, control_ticket)
 
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         """
@@ -592,8 +794,11 @@ class TargetModelRunner(ModelRunnerBase):
         assert not is_prefill, "wrong match. current stage is prefill."
         input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] target run_model")
         logits = self.run_model(input_ids, positions, is_prefill)
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] target verify start")
         self.verify(logits, seqs, temperatures)
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] target verify done")
 
     @torch.inference_mode()
     def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
@@ -601,21 +806,42 @@ class TargetModelRunner(ModelRunnerBase):
         # verify_res will be sent to the sub-process in the target group.
         num_to_be_verified_tokens = sum([1 if seq.pre_verify else self.gamma for seq in seqs])
         num_next_round_input = self.gamma * len(seqs)
-        msg = torch.zeros(num_to_be_verified_tokens + num_next_round_input, dtype=torch.int64, device="cuda")
+        msg_device = "cpu" if self.global_config.share_draft_target_gpus else "cuda"
+        msg = torch.zeros(
+            num_to_be_verified_tokens + num_next_round_input,
+            dtype=torch.int64,
+            device=msg_device,
+        )
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] target wait verify msg")
         dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] target got verify msg")
         to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
         next_round_input = msg[num_to_be_verified_tokens:].tolist()
         
-        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+        verify_res = torch.zeros(
+            (4, len(seqs)),
+            dtype=torch.int64,
+            device="cuda",
+        )
 
         if self.tp_params.local_rank == 0:
+            msg_for_compute = (
+                msg.to(device="cuda")
+                if self.global_config.share_draft_target_gpus
+                else msg
+            )
             r = torch.rand(num_to_be_verified_tokens, device="cuda")
             target_logits = norm_logits(logits, temperatures)
-            target_prob = target_logits.gather(dim=1, index=msg[:num_to_be_verified_tokens].unsqueeze(1)).squeeze(1)
+            target_prob = target_logits.gather(
+                dim=1,
+                index=msg_for_compute[:num_to_be_verified_tokens].unsqueeze(1),
+            ).squeeze(1)
             judge = (r <= target_prob).tolist()
 
             # keep original logic; add logs around sampling
-            logits.scatter_(1, msg[:num_to_be_verified_tokens].unsqueeze(1), -float("inf"))
+            logits.scatter_(
+                1, msg_for_compute[:num_to_be_verified_tokens].unsqueeze(1), -float("inf")
+            )
             revised_tokens = self.sampler(logits, temperatures)
 
             acc, rollout, revise_token, finish = [], [], [], []
@@ -657,9 +883,30 @@ class TargetModelRunner(ModelRunnerBase):
                     
                 v_idx += 1 if seq.pre_verify else self.gamma
         
-            verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
+            verify_res = torch.tensor(
+                [acc, rollout, revise_token, finish],
+                dtype=torch.int64,
+                device="cuda",
+            )
         
-        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] target broadcast verify_res")
+        if self.global_config.share_draft_target_gpus:
+            verify_res_cpu = torch.zeros_like(verify_res, device="cpu")
+            if self.tp_params.local_rank == 0:
+                verify_res_cpu.copy_(verify_res.cpu())
+            dist.broadcast(
+                verify_res_cpu,
+                src=self.global_config.target_config.master_rank,
+                group=self.world_group,
+            )
+            verify_res = verify_res_cpu
+        else:
+            dist.broadcast(
+                verify_res,
+                src=self.global_config.target_config.master_rank,
+                group=self.world_group,
+            )
+        # logger.info(f"[Rank {self.rank}: {self.group_name}] target verify_res broadcast done")
 
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()

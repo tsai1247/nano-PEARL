@@ -18,16 +18,40 @@ class TPParams:
 
 
 class BaseConfig:
-    def __init__(self, model: str, tensor_parallel_size: int, devices: list[int], group_name: str):
+    def __init__(
+        self,
+        model: str,
+        tensor_parallel_size: int,
+        ranks: list[int],
+        devices: list[int],
+        group_name: str,
+    ):
         self.model = model
         self.tensor_parallel_size = tensor_parallel_size
+        self.ranks = ranks
         self.devices = devices
         self.group_name = group_name
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.eos = self.hf_config.eos_token_id
-        self.master_rank = self.devices[0]
+        if len(self.ranks) != self.tensor_parallel_size:
+            raise ValueError(
+                "Ranks must match tensor_parallel_size, got %d vs %d"
+                % (len(self.ranks), self.tensor_parallel_size)
+            )
+        if len(self.devices) != self.tensor_parallel_size:
+            raise ValueError(
+                "Devices must match tensor_parallel_size, got %d vs %d"
+                % (len(self.devices), self.tensor_parallel_size)
+            )
+        if len(set(self.ranks)) != len(self.ranks):
+            raise ValueError("Ranks must be unique per group.")
+
+        self.rank_to_device = dict(zip(self.ranks, self.devices))
+        self.master_rank = self.ranks[0]
+        self.master_device = self.devices[0]
         logger.info(f"Model={get_model_name(self.model)}")
         logger.info(f"TP={self.tensor_parallel_size}")
+        logger.info(f"Ranks={self.ranks}")
         logger.info(f"Devices={self.devices}")
         logger.info(f"GroupName={self.group_name}")
         logger.info(f"Architectures={self.hf_config.architectures[0]}")
@@ -74,6 +98,7 @@ class PEARLConfig:
     target_tensor_parallel_size: int = 2
     draft_group_name: str = "draft_group"
     target_group_name: str = "target_group"
+    share_draft_target_gpus: bool = False
     max_num_batched_tokens: int = 16384 # 8192 for 40GB GPUs
     max_num_seqs: int = 512 # 128 or 256 for 40GB GPUs
     max_model_len: int = 4096
@@ -85,18 +110,46 @@ class PEARLConfig:
     def __post_init__(self):
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
+        draft_ranks = list(range(self.draft_tensor_parallel_size))
         draft_devices = list(range(self.draft_tensor_parallel_size))
-        self.draft_config = BaseConfig(self.draft_model_path, self.draft_tensor_parallel_size, draft_devices, self.draft_group_name)
+        self.draft_config = BaseConfig(
+            self.draft_model_path,
+            self.draft_tensor_parallel_size,
+            draft_ranks,
+            draft_devices,
+            self.draft_group_name,
+        )
         logger.info("="*50)
         logger.info(f"Loading Target Config:")
-        target_devices = list(range(len(draft_devices), len(draft_devices) + self.target_tensor_parallel_size))
-        self.target_config = BaseConfig(self.target_model_path, self.target_tensor_parallel_size, target_devices, self.target_group_name)
+        target_ranks = list(
+            range(
+                self.draft_tensor_parallel_size,
+                self.draft_tensor_parallel_size + self.target_tensor_parallel_size,
+            )
+        )
+        if self.share_draft_target_gpus:
+            target_devices = list(range(self.target_tensor_parallel_size))
+        else:
+            target_devices = list(
+                range(
+                    len(draft_devices),
+                    len(draft_devices) + self.target_tensor_parallel_size,
+                )
+            )
+        self.target_config = BaseConfig(
+            self.target_model_path,
+            self.target_tensor_parallel_size,
+            target_ranks,
+            target_devices,
+            self.target_group_name,
+        )
         logger.info("="*50)
         logger.info(f"Global_Config:")
         logger.info(f"Max_Num_Batched_Tokens={self.max_num_batched_tokens}")
         logger.info(f"Max_Num_Seqs={self.max_num_seqs}")
         logger.info(f"Max_Model_Len={self.max_model_len}")
         logger.info(f"GPU_Memory_Utilization={self.gpu_memory_utilization}")
+        logger.info(f"Share_Draft_Target_Gpus={self.share_draft_target_gpus}")
         logger.info(f"Enforce_Eager={self.enforce_eager}")
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         assert self.draft_config.eos == self.target_config.eos
