@@ -54,6 +54,26 @@ class ModelRunnerBase:
         self.gamma = self.global_config.gamma
         self._stream_started = False
         self._stream_prev_lengths: dict[int, int] = {}
+        self._stream_barrier_interval = max(
+            int(os.getenv("NANO_PEARL_STREAM_BARRIER_INTERVAL", "1")), 1
+        )
+        self._stream_barrier_step = 0
+        self._enable_pearl_decode_buffers = bool(
+            int(os.getenv("NANO_PEARL_ENABLE_DECODE_BUFFERS", "0"))
+        )
+        self._accept_rate_log_interval = max(
+            int(os.getenv("NANO_PEARL_ACCEPT_RATE_LOG_INTERVAL", "50")), 0
+        )
+        self._accept_rate_step = 0
+        self._accept_rate_accum_accept = 0
+        self._accept_rate_accum_total = 0
+        self._pearl_decode_capacity = 0
+        self._pearl_decode_block_cols = 0
+        self._pearl_decode_input_ids = None
+        self._pearl_decode_positions = None
+        self._pearl_decode_slot_mapping = None
+        self._pearl_decode_context_lens = None
+        self._pearl_decode_block_tables = None
 
         self.init_dist()
         self.init_model_and_kvcache()
@@ -258,6 +278,7 @@ class ModelRunnerBase:
             self.scheduler.finished.append(seq)
 
     def _stream_write_output(self, prev_lengths: dict[int, int]):
+        done = self.scheduler.is_finished()
         if self.rank == self.global_config.target_config.master_rank:
             output = []
             for seq in list(self.scheduler.running) + list(self.scheduler.finished):
@@ -270,7 +291,6 @@ class ModelRunnerBase:
                 if new_tokens:
                     output.append((seq.seq_id, new_tokens))
                     prev_lengths[seq.seq_id] = prev_len + len(new_tokens)
-            done = self.scheduler.is_finished()
             data = pickle.dumps([output, done])
             n = len(data)
             self.shm.buf[0:4] = n.to_bytes(4, "little")
@@ -282,6 +302,7 @@ class ModelRunnerBase:
     def _reset_stream_state(self):
         self._stream_started = False
         self._stream_prev_lengths.clear()
+        self._stream_barrier_step = 0
 
     def read_shm(self):
         self.event.wait()
@@ -838,6 +859,48 @@ class TargetModelRunner(ModelRunnerBase):
         control_ticket,
     ):
         super().__init__(config, rank, event, control_event, control_ticket)
+        self._pearl_decode_capacity = 0
+        self._pearl_decode_block_cols = 0
+        self._pearl_decode_input_ids = None
+        self._pearl_decode_positions = None
+        self._pearl_decode_slot_mapping = None
+        self._pearl_decode_context_lens = None
+        self._pearl_decode_block_tables = None
+
+    def _ensure_pearl_decode_buffers(self, num_tokens: int, block_cols: int):
+        if num_tokens <= 0:
+            return
+        if self._pearl_decode_capacity < num_tokens:
+            new_cap = max(num_tokens, self._pearl_decode_capacity * 2, 256)
+            self._pearl_decode_capacity = new_cap
+            device = torch.device("cuda")
+            self._pearl_decode_input_ids = torch.empty(
+                new_cap, dtype=torch.int64, device=device
+            )
+            self._pearl_decode_positions = torch.empty(
+                new_cap, dtype=torch.int64, device=device
+            )
+            self._pearl_decode_slot_mapping = torch.empty(
+                new_cap, dtype=torch.int32, device=device
+            )
+            self._pearl_decode_context_lens = torch.empty(
+                new_cap, dtype=torch.int32, device=device
+            )
+        if block_cols <= 0:
+            return
+        if (
+            self._pearl_decode_block_tables is None
+            or self._pearl_decode_block_cols < block_cols
+            or self._pearl_decode_block_tables.size(0)
+            < self._pearl_decode_capacity
+        ):
+            self._pearl_decode_block_cols = max(block_cols, self._pearl_decode_block_cols)
+            device = torch.device("cuda")
+            self._pearl_decode_block_tables = torch.empty(
+                (self._pearl_decode_capacity, self._pearl_decode_block_cols),
+                dtype=torch.int32,
+                device=device,
+            )
 
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         """
@@ -861,13 +924,73 @@ class TargetModelRunner(ModelRunnerBase):
             context_lens.extend(list(range(len(seq) - num_tokens + 1, len(seq) + 1)))
             slot_mapping.extend([seq.token_to_slot(token_index) for token_index in range(len(seq) - num_tokens, len(seq))])
             temp_seqs.extend([seq] * num_tokens)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(temp_seqs)
-        set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions, temp_seqs
+        if not self._enable_pearl_decode_buffers:
+            input_ids = torch.tensor(
+                input_ids, dtype=torch.int64, pin_memory=True
+            ).cuda(non_blocking=True)
+            positions = torch.tensor(
+                positions, dtype=torch.int64, pin_memory=True
+            ).cuda(non_blocking=True)
+            slot_mapping = torch.tensor(
+                slot_mapping, dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True)
+            context_lens = torch.tensor(
+                context_lens, dtype=torch.int32, pin_memory=True
+            ).cuda(non_blocking=True)
+            block_tables = self.prepare_block_tables(temp_seqs)
+            set_context(
+                self.tp_params,
+                False,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+            )
+            return input_ids, positions, temp_seqs
+        num_tokens = len(input_ids)
+        max_block_len = max(len(seq.block_table) for seq in temp_seqs) if temp_seqs else 0
+        self._ensure_pearl_decode_buffers(num_tokens, max_block_len)
+        input_ids_cpu = torch.tensor(
+            input_ids, dtype=torch.int64, pin_memory=True
+        )
+        positions_cpu = torch.tensor(
+            positions, dtype=torch.int64, pin_memory=True
+        )
+        slot_mapping_cpu = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        )
+        context_lens_cpu = torch.tensor(
+            context_lens, dtype=torch.int32, pin_memory=True
+        )
+        input_ids_gpu = self._pearl_decode_input_ids[:num_tokens]
+        positions_gpu = self._pearl_decode_positions[:num_tokens]
+        slot_mapping_gpu = self._pearl_decode_slot_mapping[:num_tokens]
+        context_lens_gpu = self._pearl_decode_context_lens[:num_tokens]
+        input_ids_gpu.copy_(input_ids_cpu, non_blocking=True)
+        positions_gpu.copy_(positions_cpu, non_blocking=True)
+        slot_mapping_gpu.copy_(slot_mapping_cpu, non_blocking=True)
+        context_lens_gpu.copy_(context_lens_cpu, non_blocking=True)
+        block_tables_gpu = self._pearl_decode_block_tables[:num_tokens, :max_block_len]
+        block_tables_cpu = torch.full(
+            (num_tokens, max_block_len),
+            -1,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        for idx, seq in enumerate(temp_seqs):
+            block_table = seq.block_table
+            if block_table:
+                block_tables_cpu[idx, : len(block_table)] = torch.as_tensor(
+                    block_table, dtype=torch.int32
+                )
+        block_tables_gpu.copy_(block_tables_cpu, non_blocking=True)
+        set_context(
+            self.tp_params,
+            False,
+            slot_mapping=slot_mapping_gpu,
+            context_lens=context_lens_gpu,
+            block_tables=block_tables_gpu,
+        )
+        return input_ids_gpu, positions_gpu, temp_seqs
 
     def pearl_step(self):
         seqs, is_prefill = self.scheduler.schedule()
@@ -925,6 +1048,8 @@ class TargetModelRunner(ModelRunnerBase):
             revised_tokens = self.sampler(logits, temperatures)
 
             acc, rollout, revise_token, finish = [], [], [], []
+            accepted_tokens = 0
+            proposed_tokens = num_to_be_verified_tokens
 
             v_idx = 0
             for i, seq in enumerate(seqs):
@@ -932,6 +1057,8 @@ class TargetModelRunner(ModelRunnerBase):
                     acc.append(judge[v_idx])
                     rollout.append(0 if judge[v_idx] else self.gamma)
                     revise_token.append(revised_tokens[v_idx])
+                    if judge[v_idx]:
+                        accepted_tokens += 1
 
                     if judge[v_idx]:
                         seq.cur_acc_tokens += 1
@@ -954,6 +1081,7 @@ class TargetModelRunner(ModelRunnerBase):
                     rollout.append(self.gamma - n)
                     revise_token.append(revised_tokens[n + v_idx] if n < self.gamma else -1)
                     finish.append(finish_flag or seq.num_completion_tokens >= seq.max_tokens - min(n + 1, self.gamma))
+                    accepted_tokens += n
 
                     if n == self.gamma:
                         seq.cur_acc_tokens += n
@@ -962,6 +1090,28 @@ class TargetModelRunner(ModelRunnerBase):
                         seq.cur_acc_tokens = 0
                     
                 v_idx += 1 if seq.pre_verify else self.gamma
+
+            if (
+                self._accept_rate_log_interval > 0
+                and self.rank == self.global_config.target_config.master_rank
+            ):
+                self._accept_rate_step += 1
+                self._accept_rate_accum_accept += accepted_tokens
+                self._accept_rate_accum_total += proposed_tokens
+                if self._accept_rate_step % self._accept_rate_log_interval == 0:
+                    denom = max(self._accept_rate_accum_total, 1)
+                    rate = self._accept_rate_accum_accept / denom
+                    logger.info(
+                        "[Rank %s: %s] nano-pearl accept rate %.4f (%d/%d) over %d steps",
+                        self.rank,
+                        self.group_name,
+                        rate,
+                        self._accept_rate_accum_accept,
+                        self._accept_rate_accum_total,
+                        self._accept_rate_log_interval,
+                    )
+                    self._accept_rate_accum_accept = 0
+                    self._accept_rate_accum_total = 0
         
             verify_res = torch.tensor(
                 [acc, rollout, revise_token, finish],
