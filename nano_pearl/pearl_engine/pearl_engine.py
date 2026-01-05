@@ -69,8 +69,13 @@ class Controller:
     def read_stream_output(self):
         n = int.from_bytes(self.target_shm.buf[0:4], "little")
         data = self.target_shm.buf[4:n+4]
-        output, done = pickle.loads(data)
-        return output, done
+        payload = pickle.loads(data)
+        if isinstance(payload, (list, tuple)) and len(payload) == 3:
+            output, done, finished_ids = payload
+        else:
+            output, done = payload
+            finished_ids = []
+        return output, done, finished_ids
 
 
 class PEARLEngine:    
@@ -198,9 +203,9 @@ class PEARLEngine:
 
         while True:
             self._wait_for_control_event("pearl_stream_generate", expected=expected)
-            output, done = self.controller.read_stream_output()
+            output, done, finished_ids = self.controller.read_stream_output()
             output = self._maybe_sort_output(output)
-            yield output, done
+            yield output, done, finished_ids
             if done:
                 break
             expected = self._next_control_ticket()
@@ -210,18 +215,18 @@ class PEARLEngine:
         self.controller.write_draft_shm("pearl_stream_step")
         self.controller.write_target_shm("pearl_stream_step")
         self._wait_for_control_event("pearl_stream_step", expected=expected)
-        output, done = self.controller.read_stream_output()
+        output, done, finished_ids = self.controller.read_stream_output()
         output = self._maybe_sort_output(output)
-        return output, done
+        return output, done, finished_ids
 
     def stream_generate_steps(self, steps: int):
         expected = self._next_control_ticket()
         self.controller.write_draft_shm("pearl_stream_steps", steps)
         self.controller.write_target_shm("pearl_stream_steps", steps)
         self._wait_for_control_event("pearl_stream_steps", expected=expected)
-        output, done = self.controller.read_stream_output()
+        output, done, finished_ids = self.controller.read_stream_output()
         output = self._maybe_sort_output(output)
-        return output, done
+        return output, done, finished_ids
 
     def generate(self):
         output, time = self.generate_tokens()

@@ -58,6 +58,7 @@ class ModelRunnerBase:
             int(os.getenv("NANO_PEARL_STREAM_BARRIER_INTERVAL", "1")), 1
         )
         self._stream_barrier_step = 0
+        self._stream_reported_finished: set[int] = set()
         self._enable_pearl_decode_buffers = bool(
             int(os.getenv("NANO_PEARL_ENABLE_DECODE_BUFFERS", "0"))
         )
@@ -295,6 +296,7 @@ class ModelRunnerBase:
         done = self.scheduler.is_finished()
         if self.rank == self.global_config.target_config.master_rank:
             output = []
+            finished_ids = []
             for seq in list(self.scheduler.running) + list(self.scheduler.finished):
                 prev_len = prev_lengths.get(seq.seq_id, 0)
                 cur_len = seq.num_completion_tokens
@@ -305,7 +307,11 @@ class ModelRunnerBase:
                 if new_tokens:
                     output.append((seq.seq_id, new_tokens))
                     prev_lengths[seq.seq_id] = prev_len + len(new_tokens)
-            data = pickle.dumps([output, done])
+            for seq in list(self.scheduler.finished):
+                if seq.seq_id not in self._stream_reported_finished:
+                    finished_ids.append(seq.seq_id)
+                    self._stream_reported_finished.add(seq.seq_id)
+            data = pickle.dumps([output, done, finished_ids])
             n = len(data)
             self.shm.buf[0:4] = n.to_bytes(4, "little")
             self.shm.buf[4:n+4] = data
@@ -334,6 +340,7 @@ class ModelRunnerBase:
         self._stream_started = False
         self._stream_prev_lengths.clear()
         self._stream_barrier_step = 0
+        self._stream_reported_finished.clear()
 
     def _maybe_adjust_gamma(self, accept_rate: float):
         if not self._accept_rate_adapt_gamma:
