@@ -64,6 +64,19 @@ class ModelRunnerBase:
         self._accept_rate_log_interval = max(
             int(os.getenv("NANO_PEARL_ACCEPT_RATE_LOG_INTERVAL", "50")), 0
         )
+        self._accept_rate_adapt_gamma = bool(
+            int(os.getenv("NANO_PEARL_ADAPT_GAMMA", "0"))
+        )
+        self._accept_rate_low = float(
+            os.getenv("NANO_PEARL_ACCEPT_RATE_LOW", "0.2")
+        )
+        self._accept_rate_high = float(
+            os.getenv("NANO_PEARL_ACCEPT_RATE_HIGH", "0.5")
+        )
+        self._accept_rate_gamma_min = max(
+            int(os.getenv("NANO_PEARL_GAMMA_MIN", "2")), 1
+        )
+        self._accept_rate_gamma_max = int(os.getenv("NANO_PEARL_GAMMA_MAX", "0"))
         self._accept_rate_step = 0
         self._accept_rate_accum_accept = 0
         self._accept_rate_accum_total = 0
@@ -303,6 +316,79 @@ class ModelRunnerBase:
         self._stream_started = False
         self._stream_prev_lengths.clear()
         self._stream_barrier_step = 0
+
+    def _maybe_adjust_gamma(self, accept_rate: float):
+        if not self._accept_rate_adapt_gamma:
+            return
+        if self.gamma <= 0:
+            return
+        if self._accept_rate_gamma_max <= 0:
+            self._accept_rate_gamma_max = self.gamma
+        target_master = self.global_config.target_config.master_rank
+        new_gamma = self.gamma
+        if self.rank == target_master:
+            if (
+                accept_rate < self._accept_rate_low
+                and self.gamma > self._accept_rate_gamma_min
+            ):
+                new_gamma = self.gamma - 1
+            elif (
+                accept_rate > self._accept_rate_high
+                and self.gamma < self._accept_rate_gamma_max
+            ):
+                new_gamma = self.gamma + 1
+            if new_gamma != self.gamma:
+                logger.warning(
+                    "[Rank %s: %s] nano-pearl gamma adjust %d -> %d (accept=%.4f)",
+                    self.rank,
+                    self.group_name,
+                    self.gamma,
+                    new_gamma,
+                    accept_rate,
+                )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        gamma_tensor = torch.tensor(
+            [new_gamma if self.rank == target_master else self.gamma],
+            device=device,
+            dtype=torch.int64,
+        )
+        dist.broadcast(gamma_tensor, src=target_master, group=self.world_group)
+        self.gamma = int(gamma_tensor.item())
+
+    def _update_accept_rate(
+        self, accepted_tokens: int, proposed_tokens: int, log: bool = False
+    ):
+        if self._accept_rate_log_interval <= 0:
+            return
+        self._accept_rate_step += 1
+        self._accept_rate_accum_accept += accepted_tokens
+        self._accept_rate_accum_total += proposed_tokens
+        if self._accept_rate_step % self._accept_rate_log_interval != 0:
+            return
+        denom = max(self._accept_rate_accum_total, 1)
+        rate = self._accept_rate_accum_accept / denom
+        target_master = self.global_config.target_config.master_rank
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        rate_tensor = torch.tensor(
+            [rate if self.rank == target_master else 0.0],
+            device=device,
+            dtype=torch.float32,
+        )
+        dist.broadcast(rate_tensor, src=target_master, group=self.world_group)
+        rate = float(rate_tensor.item())
+        if log and self.rank == target_master:
+            logger.info(
+                "[Rank %s: %s] nano-pearl accept rate %.4f (%d/%d) over %d steps",
+                self.rank,
+                self.group_name,
+                rate,
+                self._accept_rate_accum_accept,
+                self._accept_rate_accum_total,
+                self._accept_rate_log_interval,
+            )
+        self._maybe_adjust_gamma(rate)
+        self._accept_rate_accum_accept = 0
+        self._accept_rate_accum_total = 0
 
     def read_shm(self):
         self.event.wait()
@@ -823,6 +909,17 @@ class DraftModelRunner(ModelRunnerBase):
         
         # post-process the seqs according to the verify_res.
         acc, rollout, revise_token, finish = verify_res.tolist()
+        accepted_tokens = 0
+        proposed_tokens = 0
+        for idx, seq in enumerate(seqs):
+            if seq.pre_verify:
+                proposed_tokens += 1
+                if acc[idx]:
+                    accepted_tokens += 1
+            else:
+                proposed_tokens += self.gamma
+                accepted_tokens += max(self.gamma - rollout[idx], 0)
+        self._update_accept_rate(accepted_tokens, proposed_tokens, log=False)
         for idx, seq in enumerate(seqs):
             if finish[idx]:
                 seq.status = SequenceStatus.FINISHED
@@ -1091,27 +1188,11 @@ class TargetModelRunner(ModelRunnerBase):
                     
                 v_idx += 1 if seq.pre_verify else self.gamma
 
-            if (
-                self._accept_rate_log_interval > 0
-                and self.rank == self.global_config.target_config.master_rank
-            ):
-                self._accept_rate_step += 1
-                self._accept_rate_accum_accept += accepted_tokens
-                self._accept_rate_accum_total += proposed_tokens
-                if self._accept_rate_step % self._accept_rate_log_interval == 0:
-                    denom = max(self._accept_rate_accum_total, 1)
-                    rate = self._accept_rate_accum_accept / denom
-                    logger.info(
-                        "[Rank %s: %s] nano-pearl accept rate %.4f (%d/%d) over %d steps",
-                        self.rank,
-                        self.group_name,
-                        rate,
-                        self._accept_rate_accum_accept,
-                        self._accept_rate_accum_total,
-                        self._accept_rate_log_interval,
-                    )
-                    self._accept_rate_accum_accept = 0
-                    self._accept_rate_accum_total = 0
+            self._update_accept_rate(
+                accepted_tokens,
+                proposed_tokens,
+                log=(self.rank == self.global_config.target_config.master_rank),
+            )
         
             verify_res = torch.tensor(
                 [acc, rollout, revise_token, finish],
