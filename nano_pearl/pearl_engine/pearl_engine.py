@@ -190,7 +190,13 @@ class PEARLEngine:
         while True:
             self._wait_for_control_event("pearl_stream_generate", expected=expected)
             output, done = self.controller.read_stream_output()
-            output = sorted(output, key=lambda x: x[0])
+            if len(output) > 1:
+                last = output[0][0]
+                for seq_id, _ in output[1:]:
+                    if seq_id < last:
+                        output = sorted(output, key=lambda x: x[0])
+                        break
+                    last = seq_id
             yield output, done
             if done:
                 break
@@ -202,7 +208,13 @@ class PEARLEngine:
         self.controller.write_target_shm("pearl_stream_step")
         self._wait_for_control_event("pearl_stream_step", expected=expected)
         output, done = self.controller.read_stream_output()
-        output = sorted(output, key=lambda x: x[0])
+        if len(output) > 1:
+            last = output[0][0]
+            for seq_id, _ in output[1:]:
+                if seq_id < last:
+                    output = sorted(output, key=lambda x: x[0])
+                    break
+                last = seq_id
         return output, done
 
     def generate(self):
