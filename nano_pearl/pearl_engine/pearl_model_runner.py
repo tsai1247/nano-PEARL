@@ -262,6 +262,10 @@ class ModelRunnerBase:
             output = []
             for seq in list(self.scheduler.running) + list(self.scheduler.finished):
                 prev_len = prev_lengths.get(seq.seq_id, 0)
+                cur_len = seq.num_completion_tokens
+                if cur_len < prev_len:
+                    prev_len = cur_len
+                    prev_lengths[seq.seq_id] = cur_len
                 new_tokens = seq.completion_token_ids[prev_len:]
                 if new_tokens:
                     output.append((seq.seq_id, new_tokens))
