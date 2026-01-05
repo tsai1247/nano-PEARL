@@ -52,6 +52,8 @@ class ModelRunnerBase:
         self.tensor_parallel_size = self.group_config.tensor_parallel_size
         self.group_name = self.group_config.group_name
         self.gamma = self.global_config.gamma
+        self._stream_started = False
+        self._stream_prev_lengths: dict[int, int] = {}
 
         self.init_dist()
         self.init_model_and_kvcache()
@@ -223,7 +225,11 @@ class ModelRunnerBase:
                 if self.rank == 0 and method_name != "exit":
                     self._signal_control()
                 raise
-            if self.rank == 0 and method_name not in ("exit", "pearl_stream_generate"):
+            if self.rank == 0 and method_name not in (
+                "exit",
+                "pearl_stream_generate",
+                "pearl_stream_step",
+            ):
                 self._signal_control()
             
             if method_name == "exit":
@@ -268,6 +274,10 @@ class ModelRunnerBase:
         dist.barrier()
         if self.rank == 0:
             self._signal_control()
+
+    def _reset_stream_state(self):
+        self._stream_started = False
+        self._stream_prev_lengths.clear()
 
     def read_shm(self):
         self.event.wait()
@@ -532,6 +542,7 @@ class ModelRunnerBase:
 
     def clear_requests(self):
         self.scheduler.clear()
+        self._reset_stream_state()
         dist.barrier()
 
     def parallel_generate(self):
@@ -605,6 +616,30 @@ class ModelRunnerBase:
             self._stream_write_output(prev_lengths)
 
         self.clear_requests()
+
+    def pearl_stream_step(self):
+        if not self._stream_started:
+            dist.barrier()
+            self._stream_started = True
+        if not self.scheduler.waiting and not self.scheduler.running:
+            self._stream_write_output(self._stream_prev_lengths)
+            self._reset_stream_state()
+            return
+        if self.scheduler.waiting:
+            self.prefill()
+            if self.gamma == -1:
+                self.gamma = self.gamma_list[
+                    next(x for x in self.gamma_list if x >= len(self.scheduler.running))
+                ]
+                logger.info(
+                    f"[Rank {self.rank}: {self.group_name}] gamma auto-set to {self.gamma}"
+                )
+        else:
+            self.pearl_step()
+            self._force_finish_by_max_tokens()
+        self._stream_write_output(self._stream_prev_lengths)
+        if self.scheduler.is_finished():
+            self.clear_requests()
 
     def pearl_bench_generate(self, num_pearl_steps: int = 100):
         """

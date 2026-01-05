@@ -196,6 +196,15 @@ class PEARLEngine:
                 break
             expected = self._next_control_ticket()
 
+    def stream_generate_step(self):
+        expected = self._next_control_ticket()
+        self.controller.write_draft_shm("pearl_stream_step")
+        self.controller.write_target_shm("pearl_stream_step")
+        self._wait_for_control_event("pearl_stream_step", expected=expected)
+        output, done = self.controller.read_stream_output()
+        output = sorted(output, key=lambda x: x[0])
+        return output, done
+
     def generate(self):
         output, time = self.generate_tokens()
         seq_id, token_ids, num_acc_tokens = zip(*output)
