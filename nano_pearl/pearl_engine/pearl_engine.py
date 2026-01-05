@@ -107,7 +107,16 @@ class PEARLEngine:
         self._wait_for_control_event("init", expected=init_ticket)
         
         atexit.register(self.exit)
-    
+
+    def _maybe_sort_output(self, output):
+        if len(output) > 1:
+            last = output[0][0]
+            for seq_id, _ in output[1:]:
+                if seq_id < last:
+                    return sorted(output, key=lambda x: x[0])
+                last = seq_id
+        return output
+
     def _next_control_ticket(self):
         with self.control_ticket.get_lock():
             return self.control_ticket.value + 1
@@ -190,13 +199,7 @@ class PEARLEngine:
         while True:
             self._wait_for_control_event("pearl_stream_generate", expected=expected)
             output, done = self.controller.read_stream_output()
-            if len(output) > 1:
-                last = output[0][0]
-                for seq_id, _ in output[1:]:
-                    if seq_id < last:
-                        output = sorted(output, key=lambda x: x[0])
-                        break
-                    last = seq_id
+            output = self._maybe_sort_output(output)
             yield output, done
             if done:
                 break
@@ -208,13 +211,16 @@ class PEARLEngine:
         self.controller.write_target_shm("pearl_stream_step")
         self._wait_for_control_event("pearl_stream_step", expected=expected)
         output, done = self.controller.read_stream_output()
-        if len(output) > 1:
-            last = output[0][0]
-            for seq_id, _ in output[1:]:
-                if seq_id < last:
-                    output = sorted(output, key=lambda x: x[0])
-                    break
-                last = seq_id
+        output = self._maybe_sort_output(output)
+        return output, done
+
+    def stream_generate_steps(self, steps: int):
+        expected = self._next_control_ticket()
+        self.controller.write_draft_shm("pearl_stream_steps", steps)
+        self.controller.write_target_shm("pearl_stream_steps", steps)
+        self._wait_for_control_event("pearl_stream_steps", expected=expected)
+        output, done = self.controller.read_stream_output()
+        output = self._maybe_sort_output(output)
         return output, done
 
     def generate(self):

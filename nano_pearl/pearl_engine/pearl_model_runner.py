@@ -653,6 +653,39 @@ class ModelRunnerBase:
         if self.scheduler.is_finished():
             self.clear_requests()
 
+    def pearl_stream_steps(self, steps: int):
+        if not self._stream_started:
+            dist.barrier()
+            self._stream_started = True
+        try:
+            steps = int(steps)
+        except (TypeError, ValueError):
+            steps = 1
+        if steps < 1:
+            steps = 1
+        if not self.scheduler.waiting and not self.scheduler.running:
+            self._stream_write_output(self._stream_prev_lengths)
+            self._reset_stream_state()
+            return
+        if self.scheduler.waiting:
+            self.prefill()
+            if self.gamma == -1:
+                self.gamma = self.gamma_list[
+                    next(x for x in self.gamma_list if x >= len(self.scheduler.running))
+                ]
+                logger.info(
+                    f"[Rank {self.rank}: {self.group_name}] gamma auto-set to {self.gamma}"
+                )
+        else:
+            for _ in range(steps):
+                self.pearl_step()
+                self._force_finish_by_max_tokens()
+                if self.scheduler.waiting or self.scheduler.is_finished():
+                    break
+        self._stream_write_output(self._stream_prev_lengths)
+        if self.scheduler.is_finished():
+            self.clear_requests()
+
     def pearl_bench_generate(self, num_pearl_steps: int = 100):
         """
         Benchmark the real-world throughput of the PEARL algorithm.
