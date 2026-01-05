@@ -80,6 +80,7 @@ class ModelRunnerBase:
         self._accept_rate_step = 0
         self._accept_rate_accum_accept = 0
         self._accept_rate_accum_total = 0
+        self._pending_gamma = None
         self._pearl_decode_capacity = 0
         self._pearl_decode_block_cols = 0
         self._pearl_decode_input_ids = None
@@ -309,6 +310,23 @@ class ModelRunnerBase:
             self.shm.buf[0:4] = n.to_bytes(4, "little")
             self.shm.buf[4:n+4] = data
         dist.barrier()
+        if self._accept_rate_adapt_gamma:
+            target_master = self.global_config.target_config.master_rank
+            gamma_to_send = (
+                self._pending_gamma
+                if self.rank == target_master and self._pending_gamma is not None
+                else self.gamma
+            )
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            gamma_tensor = torch.tensor(
+                [gamma_to_send], device=device, dtype=torch.int64
+            )
+            dist.broadcast(gamma_tensor, src=target_master, group=self.world_group)
+            new_gamma = int(gamma_tensor.item())
+            if new_gamma != self.gamma:
+                self.gamma = new_gamma
+            if self.rank == target_master:
+                self._pending_gamma = None
         if self.rank == 0:
             self._signal_control()
 
@@ -346,14 +364,7 @@ class ModelRunnerBase:
                     new_gamma,
                     accept_rate,
                 )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        gamma_tensor = torch.tensor(
-            [new_gamma if self.rank == target_master else self.gamma],
-            device=device,
-            dtype=torch.int64,
-        )
-        dist.broadcast(gamma_tensor, src=target_master, group=self.world_group)
-        self.gamma = int(gamma_tensor.item())
+                self._pending_gamma = new_gamma
 
     def _update_accept_rate(
         self, accepted_tokens: int, proposed_tokens: int, log: bool = False
@@ -368,14 +379,6 @@ class ModelRunnerBase:
         denom = max(self._accept_rate_accum_total, 1)
         rate = self._accept_rate_accum_accept / denom
         target_master = self.global_config.target_config.master_rank
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        rate_tensor = torch.tensor(
-            [rate if self.rank == target_master else 0.0],
-            device=device,
-            dtype=torch.float32,
-        )
-        dist.broadcast(rate_tensor, src=target_master, group=self.world_group)
-        rate = float(rate_tensor.item())
         if log and self.rank == target_master:
             logger.info(
                 "[Rank %s: %s] nano-pearl accept rate %.4f (%d/%d) over %d steps",
@@ -386,7 +389,8 @@ class ModelRunnerBase:
                 self._accept_rate_accum_total,
                 self._accept_rate_log_interval,
             )
-        self._maybe_adjust_gamma(rate)
+        if self.rank == target_master:
+            self._maybe_adjust_gamma(rate)
         self._accept_rate_accum_accept = 0
         self._accept_rate_accum_total = 0
 
