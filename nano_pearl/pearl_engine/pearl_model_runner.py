@@ -380,7 +380,15 @@ class ModelRunnerBase:
         else:
             bs = input_ids.size(0)
             context = get_context(self.tp_params)
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            if not self.graph_bs:
+                return self.model.compute_logits(self.model(input_ids, positions))
+            try:
+                graph_bs = next(x for x in self.graph_bs if x >= bs)
+            except StopIteration:
+                return self.model.compute_logits(self.model(input_ids, positions))
+            graph = self.graphs.get(graph_bs)
+            if graph is None:
+                return self.model.compute_logits(self.model(input_ids, positions))
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
