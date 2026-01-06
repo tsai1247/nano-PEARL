@@ -24,6 +24,9 @@ class Controller:
         self.control_event = control_event
         self.draft_shm = self._create_shm(config.draft_config.group_name)
         self.target_shm = self._create_shm(config.target_config.group_name)
+        self.target_output_shm = self._create_shm(
+            self._output_shm_name(config.target_config.group_name)
+        )
 
     def _create_shm(self, name: str, size: int = 2**20) -> SharedMemory:
         try:
@@ -37,6 +40,9 @@ class Controller:
             except FileNotFoundError:
                 pass
             return SharedMemory(name=name, create=True, size=size)
+
+    def _output_shm_name(self, group_name: str) -> str:
+        return f"{group_name}_output"
 
     def add_event(self, rank, event):
         if rank in self.config.draft_config.ranks:
@@ -61,14 +67,14 @@ class Controller:
             event.set()
     
     def read_output(self):
-        n = int.from_bytes(self.target_shm.buf[0:4], "little")
-        data = self.target_shm.buf[4:n+4]
+        n = int.from_bytes(self.target_output_shm.buf[0:4], "little")
+        data = self.target_output_shm.buf[4:n+4]
         output, elapsed_time = pickle.loads(data)
         return output, elapsed_time
 
     def read_stream_output(self):
-        n = int.from_bytes(self.target_shm.buf[0:4], "little")
-        data = self.target_shm.buf[4:n+4]
+        n = int.from_bytes(self.target_output_shm.buf[0:4], "little")
+        data = self.target_output_shm.buf[4:n+4]
         output, done = pickle.loads(data)
         return output, done
 
@@ -161,8 +167,10 @@ class PEARLEngine:
             p.join()                   
         self.controller.draft_shm.close()
         self.controller.target_shm.close()
+        self.controller.target_output_shm.close()
         self.controller.draft_shm.unlink()
         self.controller.target_shm.unlink()
+        self.controller.target_output_shm.unlink()
         
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):

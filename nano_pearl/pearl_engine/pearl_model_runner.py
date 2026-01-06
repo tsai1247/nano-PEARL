@@ -154,6 +154,16 @@ class ModelRunnerBase:
         """
         dist.barrier()
         self.shm = SharedMemory(name=self.group_name)
+        self.output_shm = None
+        if not self.is_draft:
+            try:
+                self.output_shm = SharedMemory(name=f"{self.group_name}_output")
+            except FileNotFoundError:
+                logger.warning(
+                    "[Rank %s: %s] output shared memory missing; falling back to command shm",
+                    self.rank,
+                    self.group_name,
+                )
         if self.rank == 0:
             logger.info(f"[Sub-Process] Draft Model and Target Model initialized. Starting to run the model...", color="yellow")
             self._signal_control()
@@ -307,8 +317,9 @@ class ModelRunnerBase:
                     prev_lengths[seq.seq_id] = prev_len + len(new_tokens)
             data = pickle.dumps([output, done])
             n = len(data)
-            self.shm.buf[0:4] = n.to_bytes(4, "little")
-            self.shm.buf[4:n+4] = data
+            shm = self.output_shm or self.shm
+            shm.buf[0:4] = n.to_bytes(4, "little")
+            shm.buf[4:n+4] = data
         dist.barrier()
         if self._accept_rate_adapt_gamma:
             target_master = self.global_config.target_config.master_rank
@@ -407,6 +418,8 @@ class ModelRunnerBase:
 
     def exit(self):
         self.shm.close()
+        if self.output_shm is not None:
+            self.output_shm.close()
         if not self.global_config.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
@@ -681,11 +694,12 @@ class ModelRunnerBase:
 
         seqs = self.scheduler.finished
         output = [(seq.seq_id, seq.completion_token_ids, seq.num_acc_tokens) for seq in seqs]
-        if self.tp_params.local_rank == 0:
+        if self.rank == self.global_config.target_config.master_rank:
             data = pickle.dumps([output, end_time - start_time])
             n = len(data)
-            self.shm.buf[0:4] = n.to_bytes(4, "little")
-            self.shm.buf[4:n+4] = data
+            shm = self.output_shm or self.shm
+            shm.buf[0:4] = n.to_bytes(4, "little")
+            shm.buf[4:n+4] = data
         
         self.clear_requests()
 
@@ -715,8 +729,9 @@ class ModelRunnerBase:
         if self.rank == self.global_config.target_config.master_rank:
             data = pickle.dumps([output, end_time - start_time])
             n = len(data)
-            self.shm.buf[0:4] = n.to_bytes(4, "little")
-            self.shm.buf[4:n+4] = data
+            shm = self.output_shm or self.shm
+            shm.buf[0:4] = n.to_bytes(4, "little")
+            shm.buf[4:n+4] = data
             
         self.clear_requests()
 
@@ -832,8 +847,9 @@ class ModelRunnerBase:
         if self.rank == self.global_config.target_config.master_rank:
             data = pickle.dumps([output, end_time - start_time])
             n = len(data)
-            self.shm.buf[0:4] = n.to_bytes(4, "little")
-            self.shm.buf[4:n+4] = data
+            shm = self.output_shm or self.shm
+            shm.buf[0:4] = n.to_bytes(4, "little")
+            shm.buf[4:n+4] = data
             
         self.clear_requests()
 
