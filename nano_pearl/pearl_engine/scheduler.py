@@ -97,3 +97,19 @@ class Scheduler:
         for block in self.block_manager.blocks:
             block.hash = -1
             block.token_ids = []
+
+    def abort(self, seq_id: int) -> bool:
+        for seq in list(self.waiting):
+            if seq.seq_id == seq_id:
+                self.waiting.remove(seq)
+                return True
+        for seq in list(self.running):
+            if seq.seq_id == seq_id:
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+                return True
+        for seq in list(self.finished):
+            if seq.seq_id == seq_id:
+                self.finished.remove(seq)
+                return True
+        return False

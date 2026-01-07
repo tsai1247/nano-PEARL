@@ -180,6 +180,12 @@ class PEARLEngine:
         self.controller.write_target_shm("add_request", seq)
         self._wait_for_control_event("add_request", expected=expected)
         return seq_id
+
+    def cancel_request(self, seq_id: int):
+        expected = self._next_control_ticket()
+        self.controller.write_draft_shm("cancel_request", seq_id)
+        self.controller.write_target_shm("cancel_request", seq_id)
+        self._wait_for_control_event("cancel_request", expected=expected)
     
     def generate_tokens(self):
         expected = self._next_control_ticket()

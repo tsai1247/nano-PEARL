@@ -180,7 +180,7 @@ class ModelRunnerBase:
         load_model(self.model, self.group_config.model)
         dist.barrier()
         self.sampler = Sampler()
-        self.warmup_model()
+        # self.warmup_model()
         self.tokenizer = AutoTokenizer.from_pretrained(self.group_config.model)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -666,6 +666,12 @@ class ModelRunnerBase:
     def clear_requests(self):
         self.scheduler.clear()
         self._reset_stream_state()
+        dist.barrier()
+
+    def cancel_request(self, seq_id: int):
+        cancelled = self.scheduler.abort(seq_id)
+        if cancelled:
+            self._stream_prev_lengths.pop(seq_id, None)
         dist.barrier()
 
     def parallel_generate(self):
